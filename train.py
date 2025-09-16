@@ -21,6 +21,7 @@ import os
 import random
 import shutil
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import accelerate
@@ -44,7 +45,15 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from transformers.utils import ContextManagers
 
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel,     StableDiffusionXLPipeline
+from diffusers import (
+    AutoencoderKL,
+    DDPMScheduler,
+    StableDiffusionPipeline,
+    StableDiffusionImg2ImgPipeline,
+    UNet2DConditionModel,
+    StableDiffusionXLPipeline,
+    StableDiffusionXLImg2ImgPipeline,
+)
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, deprecate, is_wandb_available, make_image_grid
 from diffusers.utils.import_utils import is_xformers_available
@@ -58,8 +67,15 @@ if is_wandb_available():
 ## SDXL
 import functools
 import gc
-from torchvision.transforms.functional import crop
+from torchvision.transforms.functional import crop, center_crop
 from transformers import AutoTokenizer, PretrainedConfig
+
+from utils.validation_metrics import (
+    aggregate_metrics,
+    build_metric_record,
+    compute_niqe,
+    compute_pairwise_metrics,
+)
 
 
 
@@ -122,6 +138,35 @@ def parse_args():
             " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
             " or to a folder containing files that 🤗 Datasets can understand."
         ),
+    )
+    # Custom dataset support (pairwise user preferences)
+    parser.add_argument(
+        "--custom_data_root",
+        type=str,
+        default=None,
+        help=(
+            "Root folder for custom dataset with 'images/' and 'responses/' subfolders."
+        ),
+    )
+    parser.add_argument(
+        "--user_json_path",
+        type=str,
+        default=None,
+        help=(
+            "Path to user response JSON (e.g., datasets/responses/<user_id>.json) for custom pairwise dataset."
+        ),
+    )
+    parser.add_argument(
+        "--custom_n_train",
+        type=int,
+        default=60,
+        help="Number of training samples for custom pairwise dataset split (rest go to test).",
+    )
+    parser.add_argument(
+        "--caption_default",
+        type=str,
+        default="",
+        help="Default caption text to use for custom dataset items (empty for unconditional).",
     )
     parser.add_argument(
         "--dataset_config_name",
@@ -243,6 +288,11 @@ def parse_args():
     parser.add_argument(
         "--use_adafactor", action="store_true", help="Whether or not to use adafactor (should save mem)"
     )
+    parser.add_argument(
+        "--disable_xformers",
+        action="store_true",
+        help="Disable xFormers attention and use PyTorch SDPA if available (recommended on H100 without xFormers SM90).",
+    )
     # Bram Note: Haven't looked @ this yet
     parser.add_argument(
         "--allow_tf32",
@@ -310,6 +360,14 @@ def parse_args():
             " training using `--resume_from_checkpoint`."
         ),
     )
+
+    # Train logging interval (for scalars)
+    parser.add_argument(
+        "--log_scalar_steps",
+        type=int,
+        default=100,
+        help="Log scalar metrics every N steps (default 100).",
+    )
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
@@ -328,6 +386,44 @@ def parse_args():
             "The `project_name` argument passed to Accelerator.init_trackers for"
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
+    )
+
+    # Validation controls (baseline vs trained, img2img)
+    parser.add_argument(
+        "--validation_steps",
+        type=int,
+        default=1000,
+        help="If > 0, run validation (baseline vs trained) every N steps.",
+    )
+    parser.add_argument(
+        "--num_validation_images",
+        type=int,
+        default=2,
+        help="Number of test images to use during each validation event.",
+    )
+    parser.add_argument(
+        "--validation_inference_steps",
+        type=int,
+        default=20,
+        help="Num inference steps for validation img2img runs.",
+    )
+    parser.add_argument(
+        "--validation_guidance_scale",
+        type=float,
+        default=7.5,
+        help="Guidance scale for validation img2img runs.",
+    )
+    parser.add_argument(
+        "--validation_strength",
+        type=float,
+        default=0.6,
+        help="Strength parameter for img2img validation (amount of noise to add).",
+    )
+    parser.add_argument(
+        "--validation_prompts",
+        nargs='*',
+        default=None,
+        help="Optional list of prompts for validation; falls back to dataset caption or defaults.",
     )
 
     ## SDXL
@@ -370,8 +466,12 @@ def parse_args():
         args.local_rank = env_local_rank
 
     # Sanity checks
-    if args.dataset_name is None and args.train_data_dir is None:
-        raise ValueError("Need either a dataset name or a training folder.")
+    if (
+        args.dataset_name is None
+        and args.train_data_dir is None
+        and args.custom_data_root is None
+    ):
+        raise ValueError("Need either a dataset name, a training folder, or custom_data_root.")
 
     ## SDXL
     if args.sdxl:
@@ -383,6 +483,9 @@ def parse_args():
             args.resolution = 512
             
     args.train_method = 'sft' if args.sft else 'dpo'
+    # Ensure downstream checks expecting a string don't fail when using custom dataset
+    if args.custom_data_root and (args.dataset_name is None):
+        args.dataset_name = 'custom_pairwise'
     return args
 
 
@@ -601,17 +704,34 @@ def main():
     if args.train_method == 'dpo': ref_unet.requires_grad_(False)
 
     # xformers efficient attention
-    if is_xformers_available():
+    if is_xformers_available() and (not args.disable_xformers):
         import xformers
 
         xformers_version = version.parse(xformers.__version__)
         if xformers_version == version.parse("0.0.16"):
             logger.warn(
-                "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
+                "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17."
             )
-        unet.enable_xformers_memory_efficient_attention()
+        try:
+            unet.enable_xformers_memory_efficient_attention()
+        except Exception as e:
+            logger.warning(f"Failed to enable xFormers attention, falling back to PyTorch SDPA: {e}")
+            try:
+                from diffusers.models.attention_processor import AttnProcessor2_0
+                if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+                    unet.set_attn_processor(AttnProcessor2_0())
+                    logger.info("Using PyTorch SDPA attention (AttnProcessor2_0)")
+            except Exception as ee:
+                logger.warning(f"Could not set SDPA attention: {ee}")
     else:
-        raise ValueError("xformers is not available. Make sure it is installed correctly")
+        # xformers disabled or not available; try SDPA, otherwise use default attention
+        try:
+            from diffusers.models.attention_processor import AttnProcessor2_0
+            if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+                unet.set_attn_processor(AttnProcessor2_0())
+                logger.info("xFormers disabled/not available; using PyTorch SDPA attention")
+        except Exception as e:
+            logger.info(f"xFormers disabled/not available; using default attention. Reason: {e}")
 
     # BRAM NOTE: We're using >=0.16.0. Below was a bit of a bug hive. I hacked around it, but ideally ref_unet wouldn't
     # be getting passed here
@@ -684,27 +804,41 @@ def main():
         
         
         
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-            data_dir=args.train_data_dir,
+    # Build dataset
+    # - Prefer explicit custom dataset if provided
+    # - Else fall back to HF hub dataset or generic imagefolder
+    if args.custom_data_root and args.user_json_path:
+        from utils.custom_dataset import build_user_pairwise_dataset
+
+        dataset = build_user_pairwise_dataset(
+            data_root=args.custom_data_root,
+            user_json_path=args.user_json_path,
+            n_train=args.custom_n_train,
+            seed=args.seed,
+            caption_default=args.caption_default,
         )
     else:
-        data_files = {}
-        if args.train_data_dir is not None:
-            data_files[args.split] = os.path.join(args.train_data_dir, "**")
-        dataset = load_dataset(
-            "imagefolder",
-            data_files=data_files,
-            cache_dir=args.cache_dir,
-        )
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
+        # In distributed training, the load_dataset function guarantees that only one local process can concurrently
+        # download the dataset.
+        if args.dataset_name is not None:
+            # Downloading and loading a dataset from the hub.
+            dataset = load_dataset(
+                args.dataset_name,
+                args.dataset_config_name,
+                cache_dir=args.cache_dir,
+                data_dir=args.train_data_dir,
+            )
+        else:
+            data_files = {}
+            if args.train_data_dir is not None:
+                data_files[args.split] = os.path.join(args.train_data_dir, "**")
+            dataset = load_dataset(
+                "imagefolder",
+                data_files=data_files,
+                cache_dir=args.cache_dir,
+            )
+            # See more about loading custom images at
+            # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
 
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
@@ -782,6 +916,11 @@ def main():
             for im_tup, label_0 in zip(im_tup_iterator, examples['label_0']):
                 if label_0==0 and (not args.choice_model): # don't want to flip things if using choice_model for AI feedback
                     im_tup = im_tup[::-1]
+                if len(im_tup) > 1:
+                    min_h = min(t.shape[-2] for t in im_tup)
+                    min_w = min(t.shape[-1] for t in im_tup)
+                    if any((t.shape[-2] != min_h) or (t.shape[-1] != min_w) for t in im_tup):
+                        im_tup = tuple(center_crop(t, [min_h, min_w]) for t in im_tup)
                 combined_im = torch.cat(im_tup, dim=0) # no batch dim
                 combined_pixel_values.append(combined_im)
             examples["pixel_values"] = combined_pixel_values
@@ -952,6 +1091,308 @@ def main():
     if accelerator.is_main_process:
         tracker_config = dict(vars(args))
         accelerator.init_trackers(args.tracker_project_name, tracker_config)
+
+    # Determine if wandb is active for this run
+    def _is_wandb_active():
+        try:
+            log_with = accelerator.log_with
+            loggers = log_with if isinstance(log_with, (list, tuple, set)) else [log_with]
+            for logger_entry in loggers:
+                name = getattr(logger_entry, "value", logger_entry)
+                if name in ("wandb", "all"):
+                    return is_wandb_available()
+            return False
+        except Exception:
+            return False
+
+    # Validation: compare baseline vs trained (img2img) on held-out test images
+    _val_pipe_trained = None
+    _val_pipe_base = None
+
+    def _ensure_validation_pipelines():
+        nonlocal _val_pipe_trained, _val_pipe_base
+        if not accelerator.is_main_process:
+            return None, None
+        if args.sdxl:
+            if _val_pipe_trained is None:
+                _val_pipe_trained = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+                    args.pretrained_model_name_or_path, revision=args.revision, torch_dtype=torch.float32
+                ).to(accelerator.device, torch_dtype=torch.float32)
+                _val_pipe_trained.safety_checker = None
+                _val_pipe_trained.set_progress_bar_config(disable=True)
+            if _val_pipe_base is None:
+                _val_pipe_base = StableDiffusionXLImg2ImgPipeline.from_pretrained(
+                    args.pretrained_model_name_or_path, revision=args.revision, torch_dtype=torch.float32
+                ).to(accelerator.device, torch_dtype=torch.float32)
+                _val_pipe_base.safety_checker = None
+                _val_pipe_base.set_progress_bar_config(disable=True)
+        else:
+            if _val_pipe_trained is None:
+                _val_pipe_trained = StableDiffusionImg2ImgPipeline.from_pretrained(
+                    args.pretrained_model_name_or_path, revision=args.revision, torch_dtype=torch.float32
+                ).to(accelerator.device, torch_dtype=torch.float32)
+                _val_pipe_trained.safety_checker = None
+                _val_pipe_trained.set_progress_bar_config(disable=True)
+            if _val_pipe_base is None:
+                _val_pipe_base = StableDiffusionImg2ImgPipeline.from_pretrained(
+                    args.pretrained_model_name_or_path, revision=args.revision, torch_dtype=torch.float32
+                ).to(accelerator.device, torch_dtype=torch.float32)
+                _val_pipe_base.safety_checker = None
+                _val_pipe_base.set_progress_bar_config(disable=True)
+
+        # keep base as the original weights, and copy trained UNet weights into the trained pipe
+        _val_pipe_trained.unet.load_state_dict(accelerator.unwrap_model(unet).state_dict())
+        if hasattr(_val_pipe_trained, "vae") and _val_pipe_trained.vae is not None:
+            _val_pipe_trained.vae.to(accelerator.device, dtype=torch.float32)
+        return _val_pipe_trained, _val_pipe_base
+
+    def _dataset_test_len():
+        try:
+            return dataset["test"].num_rows
+        except Exception:
+            return 0
+
+    def _get_test_example(i):
+        ex = dataset["test"][i]
+        caption = ex.get("caption", "")
+        preferred = None
+        non_preferred = None
+
+        if "jpg_0" in ex and "jpg_1" in ex:
+            preferred_raw = Image.open(io.BytesIO(ex["jpg_0"])).convert("RGB")
+            non_preferred_raw = Image.open(io.BytesIO(ex["jpg_1"])).convert("RGB")
+            label_0 = ex.get("label_0", 1)
+            if label_0 == 1:
+                preferred = preferred_raw
+                non_preferred = non_preferred_raw
+            else:
+                preferred = non_preferred_raw
+                non_preferred = preferred_raw
+        elif "image" in ex:
+            # Single image without preference pair; cannot evaluate pairwise metrics
+            preferred = ex["image"].convert("RGB")
+        elif "jpg_0" in ex:
+            preferred = Image.open(io.BytesIO(ex["jpg_0"])).convert("RGB")
+
+        if preferred is None or non_preferred is None:
+            return None
+
+        return {"preferred": preferred, "non_preferred": non_preferred, "caption": caption}
+
+    def _run_validation_if_needed(step: int):
+        if args.validation_steps <= 0:
+            return
+        if step == 0 or (step % args.validation_steps != 0):
+            return
+        if not accelerator.is_main_process:
+            return
+        if not _is_wandb_active():
+            logger.debug("Skipping validation wandb logging; accelerator.log_with=%s", accelerator.log_with)
+            return
+        if _dataset_test_len() == 0:
+            return
+
+        pipe_trained, pipe_base = _ensure_validation_pipelines()
+        if pipe_trained is None or pipe_base is None:
+            return
+
+        if hasattr(pipe_trained, "unet"):
+            pipe_trained.unet.eval()
+        if hasattr(pipe_base, "unet"):
+            pipe_base.unet.eval()
+
+        base_seed = args.seed if args.seed is not None else 123
+        n = min(args.num_validation_images, _dataset_test_len())
+        indices = list(range(n))
+
+        metrics_groups = defaultdict(list)
+        table_rows = []
+        samples_for_logging = []
+
+        logger.info(
+            "Running validation at step %s over %s preference pairs", step, len(indices)
+        )
+
+        source_seed_offsets = {"preferred": 0, "nonpreferred": 1}
+        # default_prompt = "enhance details, natural colors, preserve structure"
+        default_prompt = ""
+
+        for local_idx, dataset_idx in enumerate(indices):
+            example = _get_test_example(dataset_idx)
+            if not example:
+                continue
+
+            preferred = example["preferred"]
+            non_preferred = example["non_preferred"]
+            caption = example.get("caption", "")
+            if args.validation_prompts and len(args.validation_prompts) > 0:
+                prompt = args.validation_prompts[min(local_idx, len(args.validation_prompts) - 1)]
+            else:
+                prompt = caption if (isinstance(caption, str) and caption) else default_prompt
+
+            sample_outputs = {
+                "base": {"preferred": None, "nonpreferred": None},
+                "trained": {"preferred": None, "nonpreferred": None},
+            }
+
+            for pipeline_name, pipe in (("base", pipe_base), ("trained", pipe_trained)):
+                for source_name, source_image in (("preferred", preferred), ("nonpreferred", non_preferred)):
+                    generator_seed = int(base_seed) + step * 1000 + local_idx * 10 + source_seed_offsets[source_name]
+                    generator = torch.Generator(device=accelerator.device)
+                    generator.manual_seed(generator_seed)
+                    kwargs = dict(
+                        image=source_image,
+                        prompt=prompt,
+                        strength=args.validation_strength,
+                        guidance_scale=args.validation_guidance_scale,
+                        num_inference_steps=args.validation_inference_steps,
+                        generator=generator,
+                    )
+                    try:
+                        with torch.no_grad():
+                            out = pipe(**kwargs)
+                    except Exception as e:
+                        logger.warning(
+                            f"Validation inference failed on sample {dataset_idx} ({pipeline_name}/{source_name}): {e}"
+                        )
+                        continue
+                    output_image = out.images[0] if hasattr(out, "images") and out.images else None
+                    if output_image is None:
+                        continue
+
+                    sample_outputs[pipeline_name][source_name] = output_image
+                    pair_metrics = compute_pairwise_metrics(output_image, preferred, non_preferred)
+                    niqe_score = compute_niqe(output_image)
+                    metrics_plain = build_metric_record(pair_metrics, prefix=None, niqe_score=niqe_score)
+                    group_key = f"{pipeline_name}_{source_name}"
+                    metrics_groups[group_key].append(metrics_plain)
+                    table_rows.append((dataset_idx, pipeline_name, source_name, prompt, metrics_plain))
+
+            if any(sample_outputs[p][s] is not None for p in sample_outputs for s in sample_outputs[p]):
+                samples_for_logging.append(
+                    {
+                        "dataset_index": dataset_idx,
+                        "prompt": prompt,
+                        "preferred": preferred,
+                        "nonpreferred": non_preferred,
+                        "outputs": sample_outputs,
+                    }
+                )
+
+        if not metrics_groups:
+            logger.info("Validation produced no samples; skipping wandb logging")
+            return
+
+        try:
+            import wandb as _wandb
+
+            metric_keys = [
+                "psnr_pref",
+                "psnr_nonpref",
+                "psnr_margin",
+                "ssim_pref",
+                "ssim_nonpref",
+                "ssim_margin",
+                "delta_e_pref",
+                "delta_e_nonpref",
+                "delta_e_margin",
+                "mse_pref",
+                "mse_nonpref",
+                "mse_margin",
+                "niqe",
+            ]
+
+            log_payload = {}
+
+            # Build per-sample metrics table for wandb
+            table_columns = ["sample_id", "pipeline", "source", "prompt"] + metric_keys
+            per_sample_table = _wandb.Table(columns=table_columns)
+            for dataset_idx, pipeline_name, source_name, prompt, metrics_plain in table_rows:
+                row = [dataset_idx, pipeline_name, source_name, prompt]
+                for key in metric_keys:
+                    row.append(metrics_plain.get(key))
+                per_sample_table.add_data(*row)
+
+            log_payload["validation/per_sample_metrics"] = per_sample_table
+
+            # Aggregate metrics across samples
+            summary_metrics = {}
+            for group_key, records in metrics_groups.items():
+                aggregated = aggregate_metrics(records)
+                summary_metrics.update(
+                    {f"validation/{group_key}/{metric_key}": value for metric_key, value in aggregated.items()}
+                )
+
+            def _add_margin_gain(metric_suffix: str) -> None:
+                base_key = f"validation/base_nonpreferred/{metric_suffix}"
+                trained_key = f"validation/trained_nonpreferred/{metric_suffix}"
+                if base_key in summary_metrics and trained_key in summary_metrics:
+                    gain_key = f"validation/nonpreferred/{metric_suffix}_gain"
+                    summary_metrics[gain_key] = summary_metrics[trained_key] - summary_metrics[base_key]
+
+            for suffix in [
+                "psnr_margin_mean",
+                "ssim_margin_mean",
+                "delta_e_margin_mean",
+                "mse_margin_mean",
+                "niqe_mean",
+            ]:
+                _add_margin_gain(suffix)
+
+            if summary_metrics:
+                logger.info(
+                    "Validation summary metrics: %s",
+                    {k: round(v, 4) for k, v in sorted(summary_metrics.items())},
+                )
+            log_payload.update(summary_metrics)
+
+            # Log qualitative images
+            for display_idx, sample in enumerate(samples_for_logging):
+                prompt = str(sample["prompt"])
+                caption = f"step={step} | idx={sample['dataset_index']} | {prompt}"
+                preferred = sample["preferred"]
+                non_preferred = sample["nonpreferred"]
+                outputs = sample["outputs"]
+
+                grid_images = [
+                    preferred,
+                    outputs["base"].get("preferred"),
+                    outputs["trained"].get("preferred"),
+                    non_preferred,
+                    outputs["base"].get("nonpreferred"),
+                    outputs["trained"].get("nonpreferred"),
+                ]
+                if all(im is not None for im in grid_images):
+                    try:
+                        grid = make_image_grid(grid_images, rows=2, cols=3)
+                        log_payload[f"validation/sample_{display_idx}_grid"] = _wandb.Image(grid, caption=caption)
+                    except Exception:
+                        pass
+
+                log_payload[f"validation/sample_{display_idx}_preferred_input"] = _wandb.Image(
+                    preferred, caption=f"preferred input | {prompt}"
+                )
+                log_payload[f"validation/sample_{display_idx}_nonpreferred_input"] = _wandb.Image(
+                    non_preferred, caption=f"nonpreferred input | {prompt}"
+                )
+
+                trained_nonpref = outputs["trained"].get("nonpreferred")
+                if trained_nonpref is not None:
+                    log_payload[f"validation/sample_{display_idx}_trained_nonpref"] = _wandb.Image(
+                        trained_nonpref, caption=f"trained | nonpref | {prompt}"
+                    )
+                base_nonpref = outputs["base"].get("nonpreferred")
+                if base_nonpref is not None:
+                    log_payload[f"validation/sample_{display_idx}_base_nonpref"] = _wandb.Image(
+                        base_nonpref, caption=f"base | nonpref | {prompt}"
+                    )
+
+            _wandb.log(log_payload, step=step)
+        except Exception as e:
+            logger.warning(f"Failed to log validation metrics to wandb: {e}")
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     # Training initialization
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -1170,11 +1611,15 @@ def main():
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
-                accelerator.log({"train_loss": train_loss}, step=global_step)
-                if args.train_method == 'dpo':
-                    accelerator.log({"model_mse_unaccumulated": avg_model_mse}, step=global_step)
-                    accelerator.log({"ref_mse_unaccumulated": avg_ref_mse}, step=global_step)
-                    accelerator.log({"implicit_acc_accumulated": implicit_acc_accumulated}, step=global_step)
+                # Scalar logging controlled by interval
+                if args.log_scalar_steps > 0 and (global_step % args.log_scalar_steps == 0):
+                    accelerator.log({"train_loss": train_loss}, step=global_step)
+                    if args.train_method == 'dpo':
+                        accelerator.log({"model_mse_unaccumulated": avg_model_mse}, step=global_step)
+                        accelerator.log({"ref_mse_unaccumulated": avg_ref_mse}, step=global_step)
+                        accelerator.log({"implicit_acc_accumulated": implicit_acc_accumulated}, step=global_step)
+                # Validation (baseline vs trained img2img)
+                _run_validation_if_needed(global_step)
                 train_loss = 0.0
                 implicit_acc_accumulated = 0.0
 
