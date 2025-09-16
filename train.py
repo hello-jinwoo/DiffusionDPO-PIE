@@ -40,7 +40,7 @@ from datasets import load_dataset
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from torchvision import transforms
-from tqdm.auto import tqdm
+from utils.training_progress import create_progress_bar
 from transformers import CLIPTextModel, CLIPTokenizer
 from transformers.utils import ContextManagers
 
@@ -1435,8 +1435,12 @@ def main():
         
 
     # Bram Note: This was pretty janky to wrangle to look proper but works to my liking now
-    progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
-    progress_bar.set_description("Steps")
+    progress_bar = create_progress_bar(
+        current_step=global_step,
+        max_steps=args.max_train_steps,
+        disable=not accelerator.is_local_main_process,
+        description="Steps",
+    )
 
         
     #### START MAIN TRAINING LOOP #####
