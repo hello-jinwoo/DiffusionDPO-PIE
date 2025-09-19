@@ -1,0 +1,18 @@
+accelerate launch --mixed_precision "fp16" train.py \
+    --pretrained_model_name_or_path "runwayml/stable-diffusion-v1-5" \
+    --custom_data_root "datasets" \
+    --user_json_path "datasets/responses/user_response_example.json" \
+    --train_batch_size 2 \
+    --gradient_accumulation_steps 1 \
+    --max_train_steps 1000000 \
+    --learning_rate 1e-7 \
+    --scale_lr \
+    --checkpointing_steps 1000 \
+    --beta_dpo 5000 \
+    --output_dir "out-sd15-custom" \
+    --disable_xformers \
+    --log_scalar_steps 100 \
+    --report_to wandb \
+    --tracker_project_name DiffusionDPO \
+    --validation_steps 1000 \
+    --num_validation_images 4

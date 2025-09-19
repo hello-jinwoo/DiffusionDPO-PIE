@@ -239,19 +239,23 @@ def compute_niqe(image: Image.Image | np.ndarray | torch.Tensor) -> Optional[flo
 
 
 def aggregate_metrics(collections: Sequence[Mapping[str, Optional[float]]]) -> Dict[str, float]:
-    """Aggregate metric dictionaries by computing means for each key."""
+    """Aggregate metric dictionaries by computing numeric means for each key."""
+
     stats: Dict[str, List[float]] = {}
+
     for entry in collections:
         for key, value in entry.items():
             if value is None or (isinstance(value, float) and (math.isnan(value) or math.isinf(value))):
                 continue
-            stats.setdefault(key, []).append(float(value))
+            numeric = float(value)
+            stats.setdefault(key, []).append(numeric)
 
     aggregated: Dict[str, float] = {}
     for key, values in stats.items():
         if not values:
             continue
         aggregated[f"{key}_mean"] = float(np.mean(values))
+
     return aggregated
 
 
@@ -274,10 +278,47 @@ def build_metric_record(
     return record
 
 
+def make_difference_image(
+    reference: Image.Image | np.ndarray | torch.Tensor,
+    candidate: Image.Image | np.ndarray | torch.Tensor,
+    *,
+    amplify: float = 4.0,
+    max_size: int = 512,
+) -> Image.Image:
+    """Visualize absolute difference between two images for qualitative logging."""
+
+    ref_arr = _to_numpy(reference)
+    cand_arr = _to_numpy(candidate)
+
+    min_h = min(ref_arr.shape[0], cand_arr.shape[0])
+    min_w = min(ref_arr.shape[1], cand_arr.shape[1])
+    ref_arr = _center_crop(ref_arr, min_h, min_w)
+    cand_arr = _center_crop(cand_arr, min_h, min_w)
+
+    diff = np.abs(ref_arr - cand_arr)
+    if amplify != 1.0:
+        diff = np.clip(diff * amplify, 0.0, 1.0)
+
+    diff_img = Image.fromarray((diff * 255.0).astype(np.uint8))
+    if max_size is not None:
+        largest_dim = max(diff_img.size)
+        if largest_dim > max_size:
+            scale = max_size / float(largest_dim)
+            new_size = (
+                max(1, int(round(diff_img.size[0] * scale))),
+                max(1, int(round(diff_img.size[1] * scale))),
+            )
+            resampling = getattr(Image, "Resampling", Image)
+            diff_img = diff_img.resize(new_size, resample=resampling.LANCZOS)
+
+    return diff_img
+
+
 __all__ = [
     "PairwiseMetrics",
     "compute_pairwise_metrics",
     "compute_niqe",
     "build_metric_record",
     "aggregate_metrics",
+    "make_difference_image",
 ]

@@ -1,6 +1,4 @@
 # Ignore generated assets and datasets
-scripts/
-script/
 datasets/
 docs/
 tests/
@@ -12,3 +10,6 @@ __pycache__/
 # macOS Finder artifacts
 .DS_Store
 ._*
+
+# Ignore any file or directory containing "cache"
+*cache*
